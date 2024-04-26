@@ -2,7 +2,7 @@ from vnpy_evo.event import EventEngine
 from vnpy_evo.trader.engine import MainEngine
 from vnpy_evo.trader.ui import MainWindow, create_qapp
 
-from vnpy_btse import BtseGateway
+from vnpy_btse import BtseSpotGateway
 
 
 def main():
@@ -11,7 +11,7 @@ def main():
 
     event_engine = EventEngine()
     main_engine = MainEngine(event_engine)
-    main_engine.add_gateway(BtseGateway)
+    main_engine.add_gateway(BtseSpotGateway)
 
     main_window = MainWindow(main_engine, event_engine)
     main_window.showMaximized()
