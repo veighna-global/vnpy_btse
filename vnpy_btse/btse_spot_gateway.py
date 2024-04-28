@@ -69,7 +69,9 @@ ORDERTYPE_VT2BTSE: dict[OrderType, str] = {v: k for k, v in ORDERTYPE_BTSE2VT.it
 # Direction map
 DIRECTION_BTSE2VT: dict[str, Direction] = {
     "BUY": Direction.LONG,
-    "SELL": Direction.SHORT
+    "SELL": Direction.SHORT,
+    "MODE_BUY": Direction.LONG,
+    "MODE_SELL": Direction.SHORT
 }
 DIRECTION_VT2BTSE: dict[Direction, str] = {v: k for k, v in DIRECTION_BTSE2VT.items()}
 
@@ -85,6 +87,9 @@ symbol_contract_map: dict[str, ContractData] = {}
 
 # Global set for local order id
 local_orderids: set[str] = set()
+
+local_sys_map: dict[str, str] = {}
+sys_local_map: dict[str, str] = {}
 
 
 class BtseSpotGateway(BaseGateway):
@@ -144,13 +149,13 @@ class BtseSpotGateway(BaseGateway):
         #     proxy_host,
         #     proxy_port,
         # )
-        # self.ws_api.connect(
-        #     key,
-        #     secret,
-        #     server,
-        #     proxy_host,
-        #     proxy_port,
-        # )
+        self.ws_api.connect(
+            key,
+            secret,
+            server,
+            proxy_host,
+            proxy_port,
+        )
 
     def subscribe(self, req: SubscribeRequest) -> None:
         """Subscribe market data"""
@@ -208,9 +213,6 @@ class SpotRestApi(RestClient):
 
         self.key: str = ""
         self.secret: str = ""
-
-        self.local_sys_map: dict[str, str] = {}
-        self.sys_local_map: dict[str, str] = {}
 
     def sign(self, request: Request) -> Request:
         """Standard callback for signing a request"""
@@ -312,8 +314,8 @@ class SpotRestApi(RestClient):
             local_id: str = d["clOrderID"]
             sys_id: str = d["orderID"]
 
-            self.local_sys_map[local_id] = sys_id
-            self.sys_local_map[sys_id] = local_id
+            local_sys_map[local_id] = sys_id
+            sys_local_map[sys_id] = local_id
 
             order: OrderData = OrderData(
                 symbol=d["symbol"],
@@ -612,27 +614,29 @@ class SpotWebsocketApi(WebsocketClient):
         self.key: str = ""
         self.secret: str = ""
 
-        self.callbacks: dict[str, callable] = {}
+        self.callbacks: dict[str, callable] = {
+            "login": self.on_login,
+            "notificationApiV2": self.on_order,
+            "fills": self.on_trade
+        }
 
     def connect(
         self,
         key: str,
         secret: str,
-        passphrase: str,
         server: str,
         proxy_host: str,
         proxy_port: int,
     ) -> None:
         """Start server connection"""
         self.key = key
-        self.secret = secret.encode()
-        self.passphrase = passphrase
+        self.secret = secret
 
         self.connect_time = int(datetime.now().strftime("%y%m%d%H%M%S"))
 
         server_hosts: dict[str, str] = {
-            "REAL": REAL_ORDERBOOK_HOST,
-            "TESTNET": TESTNET_ORDERBOOK_HOST,
+            "REAL": REAL_WEBSOCKET_HOST,
+            "TESTNET": TESTNET_WEBSOCKET_HOST,
         }
 
         host: str = server_hosts[server]
@@ -651,170 +655,97 @@ class SpotWebsocketApi(WebsocketClient):
 
     def on_packet(self, packet: dict) -> None:
         """Callback of data update"""
-        if "event" in packet:
-            cb_name: str = packet["event"]
-        elif "op" in packet:
-            cb_name: str = packet["op"]
-        else:
-            cb_name: str = packet["arg"]["channel"]
+        print(packet)
+        if "errors" in packet:
+            for d in packet["errors"]:
+                error: dict = d["error"]
+                error_code: int = error["code"]
+                error_message: str = error["message"]
 
-        callback: callable = self.callbacks.get(cb_name, None)
-        if callback:
-            callback(packet)
+                msg: str = f"Request caused error by websocket API, code: {error_code}, message: {error_message}"
+                self.gateway.write_log(msg)
+
+            return
+        elif "event" in packet:
+            event: str = packet["event"]
+            callback: callable = self.callbacks.get(event, None)
+            if callback:
+                callback(packet)
+        elif "topic" in packet:
+            topic: str = packet["topic"]
+            callback: callable = self.callbacks.get(topic, None)
+            if callback:
+                callback(packet)
+        else:
+            print(packet)
 
     def on_error(self, exception_type: type, exception_value: Exception, tb) -> None:
         """General error callback"""
         detail: str = self.exception_detail(exception_type, exception_value, tb)
 
-        msg: str = f"私有频道触发异常: {detail}"
+        msg: str = f"Exception catched by websocket API: {detail}"
         self.gateway.write_log(msg)
 
         print(detail)
 
-    def on_api_error(self, packet: dict) -> None:
-        """Callback of login error"""
-        code: str = packet["code"]
-        msg: str = packet["msg"]
-        self.gateway.write_log(f"Priavte websocket API request failed, status code: {code}, message: {msg}")
-
     def on_login(self, packet: dict) -> None:
         """Callback of user login"""
-        if packet["code"] == '0':
-            self.gateway.write_log("Private websocket API login successful")
-            self.subscribe_topic()
-        else:
-            self.gateway.write_log("Private websocket API login failed")
+        self.gateway.write_log("Websocket API login successful")
+
+        self.subscribe_topic()
 
     def on_order(self, packet: dict) -> None:
         """Callback of order update"""
-        data: list = packet["data"]
-        for d in data:
-            order: OrderData = parse_order_data(d, self.gateway_name)
-            self.gateway.on_order(order)
+        data: dict = packet["data"]
 
-            # Check if order is fileed
-            if d["fillSz"] == "0":
-                return
+        local_id: str = data["clOrderID"]
+        sys_id: str = data["orderID"]
 
-            # Round trade volume number
-            trade_volume: float = float(d["fillSz"])
-            contract: ContractData = symbol_contract_map.get(order.symbol, None)
-            if contract:
-                trade_volume = round_to(trade_volume, contract.min_volume)
+        local_sys_map[local_id] = sys_id
+        sys_local_map[sys_id] = local_id
 
+        order: OrderData = OrderData(
+            symbol=data["symbol"],
+            exchange=Exchange.BTSE,
+            type=ORDERTYPE_BTSE2VT[data["type"]],
+            orderid=local_id,
+            direction=DIRECTION_BTSE2VT[data["side"]],
+            offset=Offset.NONE,
+            traded=data["fillSize"],
+            price=data["price"],
+            volume=data["size"],
+            status=STATUS_BTSE2VT.get(data["status"], Status.SUBMITTING),
+            datetime=parse_timestamp(data["timestamp"]),
+            gateway_name=self.gateway_name,
+        )
+        self.gateway.on_order(order)
+
+    def on_trade(self, packet: dict) -> None:
+        """Callback of trade update"""
+        for data in packet["data"]:
             trade: TradeData = TradeData(
-                symbol=order.symbol,
-                exchange=order.exchange,
-                orderid=order.orderid,
-                tradeid=d["tradeId"],
-                direction=order.direction,
-                offset=order.offset,
-                price=float(d["fillPx"]),
-                volume=trade_volume,
-                datetime=parse_timestamp(d["uTime"]),
+                symbol=data["symbol"],
+                exchange=Exchange.BTSE,
+                orderid=data["clOrderId"],
+                tradeid=data["tradeId"],
+                direction=DIRECTION_BTSE2VT[data["side"]],
+                offset=Offset.NONE,
+                price=data["price"],
+                volume=data["size"],
+                datetime=parse_timestamp(data["timestamp"]),
                 gateway_name=self.gateway_name,
             )
             self.gateway.on_trade(trade)
 
-    def on_account(self, packet: dict) -> None:
-        """Callback of account balance update"""
-        if len(packet["data"]) == 0:
-            return
-        buf: dict = packet["data"][0]
-        for detail in buf["details"]:
-            account: AccountData = AccountData(
-                accountid=detail["ccy"],
-                balance=float(detail["eq"]),
-                gateway_name=self.gateway_name,
-            )
-            account.available = float(detail["availEq"]) if len(detail["availEq"]) != 0 else 0.0
-            account.frozen = account.balance - account.available
-            self.gateway.on_account(account)
-
-    def on_position(self, packet: dict) -> None:
-        """Callback of holding position update"""
-        data: list = packet["data"]
-        for d in data:
-            symbol: str = d["instId"]
-            pos: int = float(d["pos"])
-            price: float = get_float_value(d, "avgPx")
-            pnl: float = get_float_value(d, "upl")
-
-            position: PositionData = PositionData(
-                symbol=symbol,
-                exchange=Exchange.BTSE,
-                direction=Direction.NET,
-                volume=pos,
-                price=price,
-                pnl=pnl,
-                gateway_name=self.gateway_name,
-            )
-            self.gateway.on_position(position)
-
-    def on_send_order(self, packet: dict) -> None:
-        """Callback of send_order"""
-        data: list = packet["data"]
-
-        # Wrong parameters
-        if packet["code"] != "0":
-            if not data:
-                order: OrderData = self.reqid_order_map[packet["id"]]
-                order.status = Status.REJECTED
-                self.gateway.on_order(order)
-                return
-
-        # Failed to process
-        for d in data:
-            code: str = d["sCode"]
-            if code == "0":
-                return
-
-            orderid: str = d["clOrdId"]
-            order: OrderData = self.gateway.get_order(orderid)
-            if not order:
-                return
-            order.status = Status.REJECTED
-            self.gateway.on_order(copy(order))
-
-            msg: str = d["sMsg"]
-            self.gateway.write_log(f"Send order failed, status code: {code}, message: {msg}")
-
-    def on_cancel_order(self, packet: dict) -> None:
-        """Callback of cancel order"""
-        # Wrong parameters
-        if packet["code"] != "0":
-            code: str = packet["code"]
-            msg: str = packet["msg"]
-            self.gateway.write_log(f"Cancel order failed, status code: {code}, message: {msg}")
-            return
-
-        # Failed to process
-        data: list = packet["data"]
-        for d in data:
-            code: str = d["sCode"]
-            if code == "0":
-                return
-
-            msg: str = d["sMsg"]
-            self.gateway.write_log(f"Cancel order failed, status code: {code}, message: {msg}")
-
     def login(self) -> None:
         """User login"""
-        timestamp: str = str(time.time())
-        msg: str = timestamp + "GET" + "/users/self/verify"
-        signature: bytes = generate_signature(msg, self.secret)
+        timestamp: str = str(int(time.time() * 1000))
+        msg: str = f"/ws/spot{timestamp}"
+        signature: str = generate_signature(msg, self.secret)
 
         btse_req: dict = {
-            "op": "login",
-            "args":
-            [
-                {
-                    "apiKey": self.key,
-                    "passphrase": self.passphrase,
-                    "timestamp": timestamp,
-                    "sign": signature.decode("utf-8")
-                }
-            ]
+            "op": "authKeyExpires",
+            "args": [self.key, timestamp, signature]
         }
         self.send_packet(btse_req)
 
@@ -822,83 +753,7 @@ class SpotWebsocketApi(WebsocketClient):
         """Subscribe topics"""
         btse_req: dict = {
             "op": "subscribe",
-            "args": [
-                {
-                    "channel": "orders",
-                    "instType": "ANY"
-                },
-                {
-                    "channel": "account"
-                },
-                {
-                    "channel": "positions",
-                    "instType": "ANY"
-                },
-            ]
-        }
-        self.send_packet(btse_req)
-
-    def send_order(self, req: OrderRequest) -> str:
-        """Send new order"""
-        # Check order type
-        if req.type not in ORDERTYPE_VT2BTSE:
-            self.gateway.write_log(f"Send order failed, order type not supported: {req.type.value}")
-            return
-
-        # Check symbol
-        contract: ContractData = symbol_contract_map.get(req.symbol, None)
-        if not contract:
-            self.gateway.write_log(f"Send order failed, symbol not found: {req.symbol}")
-            return
-
-        # Generate local orderid
-        self.order_count += 1
-        count_str = str(self.order_count).rjust(6, "0")
-        orderid = f"{self.connect_time}{count_str}"
-
-        # Generate order params
-        args: dict = {
-            "instId": req.symbol,
-            "clOrdId": orderid,
-            "side": DIRECTION_VT2BTSE[req.direction],
-            "ordType": ORDERTYPE_VT2BTSE[req.type],
-            "px": str(req.price),
-            "sz": str(req.volume)
-        }
-
-        if contract.product == Product.SPOT:
-            args["tdMode"] = "cash"
-        else:
-            args["tdMode"] = "cross"
-
-        self.reqid += 1
-        btse_req: dict = {
-            "id": str(self.reqid),
-            "op": "order",
-            "args": [args]
-        }
-        self.send_packet(btse_req)
-
-        # Push submitting event
-        order: OrderData = req.create_order_data(orderid, self.gateway_name)
-        self.gateway.on_order(order)
-        return order.vt_orderid
-
-    def cancel_order(self, req: CancelRequest) -> None:
-        """Cancel existing order"""
-        args: dict = {"instId": req.symbol}
-
-        # Check if order id is local id
-        if req.orderid in local_orderids:
-            args["clOrdId"] = req.orderid
-        else:
-            args["ordId"] = req.orderid
-
-        self.reqid += 1
-        btse_req: dict = {
-            "id": str(self.reqid),
-            "op": "cancel-order",
-            "args": [args]
+            "args": ["notificationApiV2", "fills"]
         }
         self.send_packet(btse_req)
 
