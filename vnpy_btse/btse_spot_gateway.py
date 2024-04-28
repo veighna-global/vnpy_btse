@@ -61,8 +61,8 @@ STATUS_BTSE2VT: dict[str, Status] = {
 
 # Order type map
 ORDERTYPE_BTSE2VT: dict[str, OrderType] = {
-    "LIMIT": OrderType.LIMIT,
-    "MARKET": OrderType.MARKET
+    76: OrderType.LIMIT,
+    77: OrderType.MARKET
 }
 ORDERTYPE_VT2BTSE: dict[OrderType, str] = {v: k for k, v in ORDERTYPE_BTSE2VT.items()}
 
@@ -95,8 +95,8 @@ class BtseSpotGateway(BaseGateway):
     default_name = "BTSE_SPOT"
 
     default_setting: dict = {
-        "API Key": "",
-        "Secret Key": "",
+        "API Key": "b4afb5fef43d94814c8ca4f0155e734c4e367d83d51471e6dd240554888af17a",
+        "Secret Key": "0044e478db40fcd3a62e7d2970f8c27d43417d7cb3d025bd3c512ff3c085b643",
         "Server": ["REAL", "TESTNET"],
         "Proxy Host": "",
         "Proxy Port": "",
@@ -209,6 +209,9 @@ class SpotRestApi(RestClient):
         self.key: str = ""
         self.secret: str = ""
 
+        self.local_sys_map: dict[str, str] = {}
+        self.sys_local_map: dict[str, str] = {}
+
     def sign(self, request: Request) -> Request:
         """Standard callback for signing a request"""
         # Generate signature
@@ -259,6 +262,7 @@ class SpotRestApi(RestClient):
 
         self.query_time()
         self.query_order()
+        self.query_account()
         self.query_contract()
 
     def query_time(self) -> None:
@@ -273,8 +277,16 @@ class SpotRestApi(RestClient):
         """Query open orders"""
         self.add_request(
             "GET",
-            "/api/v3.2/order",
+            "/api/v3.2/user/open_orders",
             callback=self.on_query_order,
+        )
+
+    def query_account(self) -> None:
+        """Query account balance"""
+        self.add_request(
+            "GET",
+            "/api/v3.2/user/wallet",
+            callback=self.on_query_account,
         )
 
     def query_contract(self) -> None:
@@ -296,14 +308,50 @@ class SpotRestApi(RestClient):
 
     def on_query_order(self, packet: dict, request: Request) -> None:
         """Callback of open orders query"""
-        for order_info in packet["data"]:
-            order: OrderData = parse_order_data(
-                order_info,
-                self.gateway_name
+        for d in packet:
+            local_id: str = d["clOrderID"]
+            sys_id: str = d["orderID"]
+
+            self.local_sys_map[local_id] = sys_id
+            self.sys_local_map[sys_id] = local_id
+
+            order: OrderData = OrderData(
+                symbol=d["symbol"],
+                exchange=Exchange.BTSE,
+                type=ORDERTYPE_BTSE2VT[d["orderType"]],
+                orderid=local_id,
+                direction=DIRECTION_BTSE2VT[d["side"]],
+                offset=Offset.NONE,
+                traded=d["filledSize"],
+                price=d["price"],
+                volume=d["size"],
+                datetime=parse_timestamp(d["timestamp"]),
+                gateway_name=self.gateway_name,
             )
+
+            if d["orderState"] == "STATUS_ACTIVE":
+                if not order.traded:
+                    order.status = Status.NOTTRADED
+                else:
+                    order.status = Status.PARTTRADED
+
             self.gateway.on_order(order)
 
         self.gateway.write_log("Open orders data is received")
+
+    def on_query_account(self, packet: dict, request: Request) -> None:
+        """Callback of account balance query"""
+        for d in packet:
+            if not d["total"]:
+                continue
+
+            account: AccountData = AccountData(
+                accountid=d["currency"],
+                balance=d["total"],
+                frozen=d["total"] - d["available"],
+                gateway_name=self.gateway_name,
+            )
+            self.gateway.on_account(account)
 
     def on_query_contract(self, packet: dict, request: Request) -> None:
         """Callback of available contracts query"""
@@ -563,23 +611,8 @@ class SpotWebsocketApi(WebsocketClient):
 
         self.key: str = ""
         self.secret: str = ""
-        self.passphrase: str = ""
 
-        self.reqid: int = 0
-        self.order_count: int = 0
-        self.connect_time: int = 0
-
-        self.callbacks: dict[str, callable] = {
-            "login": self.on_login,
-            "orders": self.on_order,
-            "account": self.on_account,
-            "positions": self.on_position,
-            "order": self.on_send_order,
-            "cancel-order": self.on_cancel_order,
-            "error": self.on_api_error
-        }
-
-        self.reqid_order_map: dict[str, OrderData] = {}
+        self.callbacks: dict[str, callable] = {}
 
     def connect(
         self,
@@ -890,9 +923,9 @@ def generate_timestamp() -> str:
     return timestamp + "Z"
 
 
-def parse_timestamp(timestamp: str) -> datetime:
+def parse_timestamp(timestamp: int) -> datetime:
     """Parse timestamp to datetime"""
-    dt: datetime = datetime.fromtimestamp(int(timestamp) / 1000)
+    dt: datetime = datetime.fromtimestamp(timestamp / 1000)
     return dt.replace(tzinfo=UTC_TZ)
 
 
