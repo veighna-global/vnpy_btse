@@ -2,7 +2,6 @@ import hashlib
 import hmac
 import json
 import time
-from copy import copy
 from datetime import datetime
 from types import TracebackType
 
@@ -19,7 +18,7 @@ from vnpy_evo.trader.constant import (
     Status
 )
 from vnpy_evo.trader.gateway import BaseGateway
-from vnpy_evo.trader.utility import round_to, ZoneInfo
+from vnpy_evo.trader.utility import ZoneInfo
 from vnpy_evo.trader.object import (
     AccountData,
     BarData,
@@ -28,7 +27,7 @@ from vnpy_evo.trader.object import (
     HistoryRequest,
     OrderData,
     OrderRequest,
-    PositionData,
+    # PositionData,
     SubscribeRequest,
     TickData,
     TradeData
@@ -85,9 +84,7 @@ INTERVAL_VT2BTSE: dict[Interval, str] = {
 # Global dict for contract data
 symbol_contract_map: dict[str, ContractData] = {}
 
-# Global set for local order id
-local_orderids: set[str] = set()
-
+# Global map for local and sys order id
 local_sys_map: dict[str, str] = {}
 sys_local_map: dict[str, str] = {}
 
@@ -123,6 +120,7 @@ class BtseSpotGateway(BaseGateway):
         self.ws_api: SpotWebsocketApi = SpotWebsocketApi(self)
 
         self.orders: dict[str, OrderData] = {}
+        self.ticks: dict[str, TickData] = {}
 
     def connect(self, setting: dict) -> None:
         """Start server connections"""
@@ -144,11 +142,11 @@ class BtseSpotGateway(BaseGateway):
             proxy_host,
             proxy_port
         )
-        # self.ob_api.connect(
-        #     server,
-        #     proxy_host,
-        #     proxy_port,
-        # )
+        self.ob_api.connect(
+            server,
+            proxy_host,
+            proxy_port,
+        )
         self.ws_api.connect(
             key,
             secret,
@@ -159,7 +157,19 @@ class BtseSpotGateway(BaseGateway):
 
     def subscribe(self, req: SubscribeRequest) -> None:
         """Subscribe market data"""
-        self.ob_api.subscribe(req)
+        if req.symbol in self.ticks:
+            return
+
+        tick: TickData = TickData(
+            symbol=req.symbol,
+            exchange=req.exchange,
+            datetime=datetime.now(),
+            gateway_name=self.gateway_name
+        )
+        self.ticks[req.symbol] = tick
+
+        self.ws_api.subscribe_market_trade(req)
+        self.ob_api.subscribe_orderbook(req)
 
     def send_order(self, req: OrderRequest) -> str:
         """Send new order"""
@@ -195,6 +205,15 @@ class BtseSpotGateway(BaseGateway):
     def get_order(self, orderid: str) -> OrderData:
         """Get previously saved order"""
         return self.orders.get(orderid, None)
+
+    def on_tick(self, tick: TickData) -> None:
+        """Save a copy of tick and then push"""
+        self.ticks[tick.symbol] = tick
+        super().on_tick(tick)
+
+    def get_tick(self, symbol: str) -> TickData:
+        """Get previously saved tick"""
+        return self.ticks.get(symbol, None)
 
 
 class SpotRestApi(RestClient):
@@ -474,13 +493,7 @@ class SpotOrderbookApi(WebsocketClient):
         self.gateway: BtseSpotGateway = gateway
         self.gateway_name: str = gateway.gateway_name
 
-        self.subscribed: dict[str, SubscribeRequest] = {}
-        self.ticks: dict[str, TickData] = {}
-
-        self.callbacks: dict[str, callable] = {
-            "tickers": self.on_ticker,
-            "books5": self.on_depth
-        }
+        self.callbacks: dict[str, callable] = {}
 
     def connect(
         self,
@@ -490,8 +503,8 @@ class SpotOrderbookApi(WebsocketClient):
     ) -> None:
         """Start server connection"""
         server_hosts: dict[str, str] = {
-            "REAL": REAL_WEBSOCKET_HOST,
-            "TESTNET": TESTNET_WEBSOCKET_HOST,
+            "REAL": REAL_ORDERBOOK_HOST,
+            "TESTNET": TESTNET_ORDERBOOK_HOST,
         }
 
         host: str = server_hosts[server]
@@ -499,102 +512,78 @@ class SpotOrderbookApi(WebsocketClient):
 
         self.start()
 
-    def subscribe(self, req: SubscribeRequest) -> None:
+    def subscribe_orderbook(self, req: SubscribeRequest) -> None:
         """Subscribe market data"""
-        # Add subscribe record
-        self.subscribed[req.vt_symbol] = req
+        topic: str = f"snapshotL1:{req.symbol}_0"
+        self.callbacks[topic] = self.on_orderbook
 
-        # Create tick object
-        tick: TickData = TickData(
-            symbol=req.symbol,
-            exchange=req.exchange,
-            name=req.symbol,
-            datetime=datetime.now(UTC_TZ),
-            gateway_name=self.gateway_name,
-        )
-        self.ticks[req.symbol] = tick
-
-        # Send request to subscribe
-        args: list = []
-        for channel in ["tickers", "books5"]:
-            args.append({
-                "channel": channel,
-                "instId": req.symbol
-            })
-
-        req: dict = {
+        btse_req: dict = {
             "op": "subscribe",
-            "args": args
+            "args": [topic]
         }
-        self.send_packet(req)
+        self.send_packet(btse_req)
 
     def on_connected(self) -> None:
         """Callback when server is connected"""
-        self.gateway.write_log("Public websocket API is connected")
-
-        for req in list(self.subscribed.values()):
-            self.subscribe(req)
+        self.gateway.write_log("Orderbook API is connected")
 
     def on_disconnected(self) -> None:
         """Callback when server is disconnected"""
-        self.gateway.write_log("Public websocket API is disconnected")
+        self.gateway.write_log("Orderbook websocket API is disconnected")
 
     def on_packet(self, packet: dict) -> None:
         """Callback of data update"""
-        if "event" in packet:
-            event: str = packet["event"]
-            if event == "subscribe":
-                return
-            elif event == "error":
-                code: str = packet["code"]
-                msg: str = packet["msg"]
-                self.gateway.write_log(f"Public websocket API request failed, status code: {code}, message: {msg}")
-        else:
-            channel: str = packet["arg"]["channel"]
-            callback: callable = self.callbacks.get(channel, None)
+        if "errors" in packet:
+            for d in packet["errors"]:
+                error: dict = d["error"]
+                error_code: int = error["code"]
+                error_message: str = error["message"]
 
+                msg: str = f"Request caused error by orderbook API, code: {error_code}, message: {error_message}"
+                self.gateway.write_log(msg)
+
+            return
+        elif "event" in packet:
+            event: str = packet["event"]
+            callback: callable = self.callbacks.get(event, None)
             if callback:
-                data: list = packet["data"]
-                callback(data)
+                callback(packet)
+        elif "topic" in packet:
+            topic: str = packet["topic"]
+            callback: callable = self.callbacks.get(topic, None)
+            if callback:
+                callback(packet)
+        else:
+            print(packet)
 
     def on_error(self, exception_type: type, exception_value: Exception, tb) -> None:
         """General error callback"""
         detail: str = self.exception_detail(exception_type, exception_value, tb)
 
-        msg: str = f"Exception catched by public websocket API: {detail}"
+        msg: str = f"Exception catched by orderbook API: {detail}"
         self.gateway.write_log(msg)
 
         print(detail)
 
-    def on_ticker(self, data: list) -> None:
-        """Callback of ticker update"""
-        for d in data:
-            tick: TickData = self.ticks[d["instId"]]
-            tick.last_price = float(d["last"])
-            tick.open_price = float(d["open24h"])
-            tick.high_price = float(d["high24h"])
-            tick.low_price = float(d["low24h"])
-            tick.volume = float(d["vol24h"])
+    def on_orderbook(self, packet: dict) -> None:
+        """Callback of market trade update"""
+        print(packet)
+        data: dict = packet["data"]
 
-    def on_depth(self, data: list) -> None:
-        """Callback of depth update"""
-        for d in data:
-            tick: TickData = self.ticks[d["instId"]]
-            bids: list = d["bids"]
-            asks: list = d["asks"]
+        symbol: str = data["symbol"]
+        tick: TickData = self.gateway.get_tick(symbol)
 
-            for n in range(min(5, len(bids))):
-                price, volume, _, _ = bids[n]
-                tick.__setattr__("bid_price_%s" % (n + 1), float(price))
-                tick.__setattr__("bid_volume_%s" % (n + 1), float(volume))
+        bid_data: tuple = data["bids"][0]
+        tick.bid_price_1 = float(bid_data[0])
+        tick.bid_volume_1 = float(bid_data[1])
 
-            for n in range(min(5, len(asks))):
-                price, volume, _, _ = asks[n]
-                tick.__setattr__("ask_price_%s" % (n + 1), float(price))
-                tick.__setattr__("ask_volume_%s" % (n + 1), float(volume))
+        ask_data: tuple = data["asks"][0]
+        tick.ask_price_1 = float(ask_data[0])
+        tick.ask_volume_1 = float(ask_data[1])
 
-            tick.datetime = parse_timestamp(d["ts"])
-            self.gateway.on_tick(copy(tick))
+        tick.datetime = parse_timestamp(data["timestamp"])
+
+        self.gateway.on_tick(tick)
 
 
 class SpotWebsocketApi(WebsocketClient):
@@ -737,6 +726,18 @@ class SpotWebsocketApi(WebsocketClient):
             )
             self.gateway.on_trade(trade)
 
+    def on_market_trade(self, packet: dict) -> None:
+        """Callback of market trade update"""
+        for data in packet["data"]:
+            symbol: str = data["symbol"]
+            tick: TickData = self.gateway.get_tick(symbol)
+
+            tick.last_price = data["price"]
+            tick.last_volume = data["size"]
+            tick.datetime = parse_timestamp(data["timestamp"])
+
+            self.gateway.on_tick(tick)
+
     def login(self) -> None:
         """User login"""
         timestamp: str = str(int(time.time() * 1000))
@@ -754,6 +755,17 @@ class SpotWebsocketApi(WebsocketClient):
         btse_req: dict = {
             "op": "subscribe",
             "args": ["notificationApiV2", "fills"]
+        }
+        self.send_packet(btse_req)
+
+    def subscribe_market_trade(self, req: SubscribeRequest) -> None:
+        """Subscribe market trade fill"""
+        topic: str = f"tradeHistoryApi:{req.symbol}"
+        self.callbacks[topic] = self.on_market_trade
+
+        btse_req: dict = {
+            "op": "subscribe",
+            "args": [topic]
         }
         self.send_packet(btse_req)
 
@@ -790,28 +802,3 @@ def get_float_value(data: dict, key: str) -> float:
     if not data_str:
         return 0.0
     return float(data_str)
-
-
-def parse_order_data(data: dict, gateway_name: str) -> OrderData:
-    """Parse dict to order data"""
-    order_id: str = data["clOrdId"]
-    if order_id:
-        local_orderids.add(order_id)
-    else:
-        order_id: str = data["ordId"]
-
-    order: OrderData = OrderData(
-        symbol=data["instId"],
-        exchange=Exchange.BTSE,
-        type=ORDERTYPE_BTSE2VT[data["ordType"]],
-        orderid=order_id,
-        direction=DIRECTION_BTSE2VT[data["side"]],
-        offset=Offset.NONE,
-        traded=float(data["accFillSz"]),
-        price=float(data["px"]),
-        volume=float(data["sz"]),
-        datetime=parse_timestamp(data["cTime"]),
-        status=STATUS_BTSE2VT[data["state"]],
-        gateway_name=gateway_name,
-    )
-    return order
