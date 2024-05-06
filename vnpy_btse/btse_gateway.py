@@ -1012,7 +1012,7 @@ class FuturesRestApi(RestClient):
         self.gateway.write_log("Futures REST API started")
 
         self.query_order()
-        self.query_position()
+        # self.query_position()
         self.query_account()
         self.query_contract()
 
@@ -1434,7 +1434,8 @@ class FuturesWebsocketApi(WebsocketClient):
         self.callbacks: dict[str, callable] = {
             "login": self.on_login,
             "notificationApiV2": self.on_order,
-            "fills": self.on_trade
+            "fills": self.on_trade,
+            "positions": self.on_position
         }
 
     def connect(
@@ -1557,6 +1558,32 @@ class FuturesWebsocketApi(WebsocketClient):
             )
             self.gateway.on_trade(trade)
 
+    def on_position(self, packet: dict) -> None:
+        """Callback of position update"""
+        for data in packet["data"]:
+            symbol, _ = data["marketName"].split("-")
+
+            # Only support one way position
+            if data["positionMode"] not in {"ONE_WAY", None}:
+                continue
+
+            # Get volume number according to orderMode
+            if data["orderMode"] == 66:
+                volume: int = data["totalContracts"]
+            else:
+                volume: int = -data["totalContracts"]
+
+            position: PositionData = PositionData(
+                symbol=symbol,
+                exchange=Exchange.BTSE,
+                direction=Direction.NET,
+                volume=volume,
+                price=data["entryPrice"],
+                pnl=data["unrealizedProfitLoss"],
+                gateway_name=self.gateway_name,
+            )
+            self.gateway.on_position(position)
+
     def on_market_trade(self, packet: dict) -> None:
         """Callback of market trade update"""
         for data in packet["data"]:
@@ -1585,7 +1612,7 @@ class FuturesWebsocketApi(WebsocketClient):
         """Subscribe topics"""
         btse_req: dict = {
             "op": "subscribe",
-            "args": ["notificationApiV2", "fills"]
+            "args": ["notificationApiV2", "fills", "positions"]
         }
         self.send_packet(btse_req)
 
