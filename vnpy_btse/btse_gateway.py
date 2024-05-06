@@ -812,7 +812,6 @@ class SpotWebsocketApi(WebsocketClient):
 
     def on_packet(self, packet: dict) -> None:
         """Callback of data update"""
-        print(packet)
         if "errors" in packet:
             for d in packet["errors"]:
                 error: dict = d["error"]
@@ -1472,7 +1471,6 @@ class FuturesWebsocketApi(WebsocketClient):
 
     def on_packet(self, packet: dict) -> None:
         """Callback of data update"""
-        print(packet)
         if "errors" in packet:
             for d in packet["errors"]:
                 error: dict = d["error"]

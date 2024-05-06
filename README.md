@@ -5,7 +5,7 @@
 </p>
 
 <p align="center">
-    <img src ="https://img.shields.io/badge/version-2024.4.26-blueviolet.svg"/>
+    <img src ="https://img.shields.io/badge/version-2024.5.6-blueviolet.svg"/>
     <img src ="https://img.shields.io/badge/platform-windows|linux|macos-yellow.svg"/>
     <img src ="https://img.shields.io/badge/python-3.10|3.11|3.12-blue.svg" />
     <img src ="https://img.shields.io/github/license/vnpy/vnpy.svg?color=orange"/>
@@ -14,6 +14,11 @@
 ## Introduction
 
 This gateway is developed based on BTSE's REST and Websocket API, and supports spot, futures contract and swap contract trading.
+
+For derivatives contract trading, please notice:
+
+1. Only supports cross margin mode.
+2. Only supports one-way position mode.
 
 ## Install
 
@@ -40,11 +45,7 @@ from vnpy_evo.event import EventEngine
 from vnpy_evo.trader.engine import MainEngine
 from vnpy_evo.trader.ui import MainWindow, create_qapp
 
-from vnpy_btse import (
-    BinanceSpotGateway,
-    BinanceLinearGateway,
-    BinanceInverseGateway
-)
+from vnpy_btse import BtseGateway
 
 
 def main():
@@ -53,9 +54,7 @@ def main():
 
     event_engine = EventEngine()
     main_engine = MainEngine(event_engine)
-    main_engine.add_gateway(BinanceSpotGateway)
-    main_engine.add_gateway(BinanceLinearGateway)
-    main_engine.add_gateway(BinanceInverseGateway)
+    main_engine.add_gateway(BtseGateway)
 
     main_window = MainWindow(main_engine, event_engine)
     main_window.showMaximized()
