@@ -23,4 +23,4 @@
 from .btse_gateway import BtseGateway
 
 
-__version__ = "2024.5.6"
+__version__ = "2024.5.7"

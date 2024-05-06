@@ -108,8 +108,8 @@ class BtseGateway(BaseGateway):
     default_name = "BTSE"
 
     default_setting: dict = {
-        "API Key": "b4afb5fef43d94814c8ca4f0155e734c4e367d83d51471e6dd240554888af17a",
-        "Secret Key": "0044e478db40fcd3a62e7d2970f8c27d43417d7cb3d025bd3c512ff3c085b643",
+        "API Key": "",
+        "Secret Key": "",
         "Server": ["REAL", "TESTNET"],
         "Proxy Host": "",
         "Proxy Port": "",
