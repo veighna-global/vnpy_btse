@@ -20,7 +20,7 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-from .btse_spot_gateway import BtseGateway
+from .btse_gateway import BtseGateway
 
 
 __version__ = "2024.4.26"

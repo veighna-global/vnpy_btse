@@ -72,6 +72,8 @@ ORDERTYPE_BTSE2VT: dict[str, OrderType] = {
     77: OrderType.MARKET
 }
 ORDERTYPE_VT2BTSE: dict[OrderType, str] = {v: k for k, v in ORDERTYPE_BTSE2VT.items()}
+ORDERTYPE_VT2BTSE[OrderType.LIMIT] = "LIMIT"
+ORDERTYPE_VT2BTSE[OrderType.MARKET] = "MARKET"
 
 # Direction map
 DIRECTION_BTSE2VT: dict[str, Direction] = {
@@ -80,7 +82,10 @@ DIRECTION_BTSE2VT: dict[str, Direction] = {
     "MODE_BUY": Direction.LONG,
     "MODE_SELL": Direction.SHORT
 }
-DIRECTION_VT2BTSE: dict[Direction, str] = {v: k for k, v in DIRECTION_BTSE2VT.items()}
+DIRECTION_VT2BTSE: dict[Direction, str] = {
+    Direction.LONG: "BUY",
+    Direction.SHORT: "SELL"
+}
 
 # Kline interval map
 INTERVAL_VT2BTSE: dict[Interval, str] = {
@@ -211,11 +216,25 @@ class BtseGateway(BaseGateway):
 
     def send_order(self, req: OrderRequest) -> str:
         """Send new order"""
-        return self.spot_ws_api.send_order(req)
+        contract: ContractData = self.contracts.get(req.symbol, None)
+        if not contract:
+            return ""
+
+        if contract.product == Product.SPOT:
+            return self.spot_rest_api.send_order(req)
+        else:
+            return self.futures_rest_api.send_order(req)
 
     def cancel_order(self, req: CancelRequest) -> None:
         """Cancel existing order"""
-        self.spot_ws_api.cancel_order(req)
+        contract: ContractData = self.contracts.get(req.symbol, None)
+        if not contract:
+            return
+
+        if contract.product == Product.SPOT:
+            return self.spot_rest_api.cancel_order(req)
+        else:
+            return self.futures_rest_api.cancel_order(req)
 
     def query_account(self) -> None:
         """Not required since BTSE provides websocket update"""
@@ -276,6 +295,9 @@ class SpotRestApi(RestClient):
         self.key: str = ""
         self.secret: str = ""
 
+        self.order_count: int = 1_000_000
+        self.order_prefix: str = ""
+
     def sign(self, request: Request) -> Request:
         """Standard callback for signing a request"""
         # Generate signature
@@ -310,6 +332,8 @@ class SpotRestApi(RestClient):
         """Start server connection"""
         self.key = key
         self.secret = secret
+
+        self.order_prefix = datetime.now().strftime("%y%m%d%H%M%S")
 
         server_hosts: dict[str, str] = {
             "REAL": REAL_SPOT_REST_HOST,
@@ -357,6 +381,61 @@ class SpotRestApi(RestClient):
             "GET",
             "/api/v3.2/market_summary",
             callback=self.on_query_contract
+        )
+
+    def send_order(self, req: OrderRequest) -> str:
+        """Send new order"""
+        # Generate new order id
+        self.order_count += 1
+        orderid: str = self.order_prefix + str(self.order_count)
+
+        # Push a submitting order event
+        order: OrderData = req.create_order_data(
+            orderid,
+            self.gateway_name
+        )
+        self.gateway.on_order(order)
+
+        data: dict = {
+            "symbol": req.symbol,
+            "size": req.volume,
+            "side": DIRECTION_VT2BTSE[req.direction],
+            "type": ORDERTYPE_VT2BTSE[req.type],
+            "clOrderID": orderid,
+        }
+
+        if req.type == OrderType.LIMIT:
+            data["time_in_force"] = "GTC"
+            data["price"] = req.price
+
+        self.add_request(
+            method="POST",
+            path="/api/v3.2/order",
+            callback=self.on_send_order,
+            data=data,
+            extra=order,
+            on_error=self.on_send_order_error,
+            on_failed=self.on_send_order_failed
+        )
+
+        return order.vt_orderid
+
+    def cancel_order(self, req: CancelRequest) -> None:
+        """Cancel existing order"""
+        data: dict = {
+            "symbol": req.symbol,
+            "clOrderID": req.orderid
+        }
+
+        order: OrderData = self.gateway.get_order(req.orderid)
+
+        self.add_request(
+            method="DELETE",
+            path="/api/v3.2/order",
+            callback=self.on_cancel_order,
+            data=data,
+            on_failed=self.on_cancel_failed,
+            extra=order
         )
 
     def on_query_time(self, packet: dict, request: Request) -> None:
@@ -451,6 +530,42 @@ class SpotRestApi(RestClient):
         self.gateway.write_log(msg)
 
         print(detail)
+
+    def on_send_order(self, data: dict, request: Request) -> None:
+        """Successful callback of send_order"""
+        pass
+
+    def on_send_order_failed(self, status_code: str, request: Request) -> None:
+        """Failed callback of send_order"""
+        order: OrderData = request.extra
+        order.status = Status.REJECTED
+        self.gateway.on_order(order)
+
+        msg: str = f"Send spot order failed, status code: {status_code}, message: {request.response.text}"
+        self.gateway.write_log(msg)
+
+    def on_send_order_error(self, exception_type: type, exception_value: Exception, tb, request: Request) -> None:
+        """Error callback of send_order"""
+        order: OrderData = request.extra
+        order.status = Status.REJECTED
+        self.gateway.on_order(order)
+
+        if not issubclass(exception_type, ConnectionError):
+            self.on_error(exception_type, exception_value, tb, request)
+
+    def on_cancel_order(self, data: dict, request: Request) -> None:
+        """Successful callback of cancel_order"""
+        pass
+
+    def on_cancel_failed(self, status_code: str, request: Request) -> None:
+        """Failed callback of cancel_order"""
+        if request.extra:
+            order = request.extra
+            order.status = Status.REJECTED
+            self.gateway.on_order(order)
+
+        msg = f"Cancel spot order failed, status code: {status_code}, message: {request.response.text}, order: {request.extra} "
+        self.gateway.write_log(msg)
 
     def query_history(self, req: HistoryRequest) -> list[BarData]:
         """Query kline history data"""
@@ -608,7 +723,6 @@ class SpotOrderbookApi(WebsocketClient):
 
     def on_orderbook(self, packet: dict) -> None:
         """Callback of market trade update"""
-        print(packet)
         data: dict = packet["data"]
 
         symbol: str = data["symbol"]
@@ -1145,7 +1259,6 @@ class FuturesOrderbookApi(WebsocketClient):
 
     def on_orderbook(self, packet: dict) -> None:
         """Callback of market trade update"""
-        print(packet)
         data: dict = packet["data"]
 
         symbol: str = data["symbol"]
