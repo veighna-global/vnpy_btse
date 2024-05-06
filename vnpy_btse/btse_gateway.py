@@ -304,8 +304,8 @@ class SpotRestApi(RestClient):
         timestamp: str = str(int(time.time() * 1000))
 
         body: str = ""
-        if request.data:
-            body = json.dumps(request.data)
+        if request.json:
+            body = json.dumps(request.json)
 
         msg: str = f"{request.path}{timestamp}{body}"
         signature: bytes = generate_signature(msg, self.secret)
@@ -412,7 +412,7 @@ class SpotRestApi(RestClient):
             method="POST",
             path="/api/v3.2/order",
             callback=self.on_send_order,
-            data=data,
+            json=data,
             extra=order,
             on_error=self.on_send_order_error,
             on_failed=self.on_send_order_failed
@@ -433,7 +433,7 @@ class SpotRestApi(RestClient):
             method="DELETE",
             path="/api/v3.2/order",
             callback=self.on_cancel_order,
-            data=data,
+            json=data,
             on_failed=self.on_cancel_failed,
             extra=order
         )
@@ -946,8 +946,8 @@ class FuturesRestApi(RestClient):
         timestamp: str = str(int(time.time() * 1000))
 
         body: str = ""
-        if request.data:
-            body = json.dumps(request.data)
+        if request.json:
+            body = json.dumps(request.json)
 
         msg: str = f"{request.path}{timestamp}{body}"
         signature: bytes = generate_signature(msg, self.secret)
