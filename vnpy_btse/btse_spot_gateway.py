@@ -40,18 +40,22 @@ from vnpy_websocket import WebsocketClient
 UTC_TZ: ZoneInfo = ZoneInfo("UTC")
 
 # Real server hosts
-REAL_REST_HOST: str = "https://api.btse.com/spot"
-REAL_WEBSOCKET_HOST: str = "wss://ws.btse.com/ws/spot"
-REAL_ORDERBOOK_HOST: str = "wss://ws.btse.com/ws/oss/spot"
+REAL_SPOT_REST_HOST: str = "https://api.btse.com/spot"
+REAL_SPOT_WEBSOCKET_HOST: str = "wss://ws.btse.com/ws/spot"
+REAL_SPOT_ORDERBOOK_HOST: str = "wss://ws.btse.com/ws/oss/spot"
 
 REAL_FUTURES_REST_HOST: str = "https://api.btse.com/futures"
+REAL_FUTURES_WEBSOCKET_HOST: str = "wss://ws.btse.com/ws/futures"
+REAL_FUTURES_ORDERBOOK_HOST: str = "wss://ws.btse.com/ws/oss/futures"
 
 # Testnet server hosts
-TESTNET_REST_HOST: str = "https://testapi.btse.io/spot"
-TESTNET_WEBSOCKET_HOST: str = "wss://testws.btse.io/ws/spot"
-TESTNET_ORDERBOOK_HOST: str = "wss://testws.btse.io/ws/oss/spot"
+TESTNET_SPOT_REST_HOST: str = "https://testapi.btse.io/spot"
+TESTNET_SPOT_WEBSOCKET_HOST: str = "wss://testws.btse.io/ws/spot"
+TESTNET_SPOT_ORDERBOOK_HOST: str = "wss://testws.btse.io/ws/oss/spot"
 
 TESTNET_FUTURES_REST_HOST: str = "https://testapi.btse.io/futures"
+TESTNET_FUTURES_WEBSOCKET_HOST: str = "wss://testws.btse.io/ws/futures"
+TESTNET_FUTURES_ORDERBOOK_HOST: str = "wss://testws.btse.io/ws/oss/futures"
 
 # Order status map
 STATUS_BTSE2VT: dict[str, Status] = {
@@ -85,9 +89,6 @@ INTERVAL_VT2BTSE: dict[Interval, str] = {
     Interval.DAILY: "1440",
 }
 
-# Global dict for contract data
-symbol_contract_map: dict[str, ContractData] = {}
-
 # Global map for local and sys order id
 local_sys_map: dict[str, str] = {}
 sys_local_map: dict[str, str] = {}
@@ -98,7 +99,7 @@ class BtseGateway(BaseGateway):
     The BTSE spot trading gateway for VeighNa.
     """
 
-    default_name = "BTSE_SPOT"
+    default_name = "BTSE"
 
     default_setting: dict = {
         "API Key": "b4afb5fef43d94814c8ca4f0155e734c4e367d83d51471e6dd240554888af17a",
@@ -129,6 +130,7 @@ class BtseGateway(BaseGateway):
 
         self.orders: dict[str, OrderData] = {}
         self.ticks: dict[str, TickData] = {}
+        self.contracts: dict[str, ContractData] = {}
 
     def connect(self, setting: dict) -> None:
         """Start server connections"""
@@ -150,6 +152,19 @@ class BtseGateway(BaseGateway):
             proxy_host,
             proxy_port
         )
+        self.spot_ob_api.connect(
+            server,
+            proxy_host,
+            proxy_port,
+        )
+        self.spot_ws_api.connect(
+            key,
+            secret,
+            server,
+            proxy_host,
+            proxy_port,
+        )
+
         self.futures_rest_api.connect(
             key,
             secret,
@@ -157,13 +172,12 @@ class BtseGateway(BaseGateway):
             proxy_host,
             proxy_port
         )
-
-        self.spot_ob_api.connect(
+        self.futures_ob_api.connect(
             server,
             proxy_host,
             proxy_port,
         )
-        self.spot_ws_api.connect(
+        self.futures_ws_api.connect(
             key,
             secret,
             server,
@@ -184,8 +198,16 @@ class BtseGateway(BaseGateway):
         )
         self.ticks[req.symbol] = tick
 
-        self.spot_ws_api.subscribe_market_trade(req)
-        self.spot_ob_api.subscribe_orderbook(req)
+        contract: ContractData = self.contracts.get(req.symbol, None)
+        if not contract:
+            return
+
+        if contract.product == Product.SPOT:
+            self.spot_ws_api.subscribe_market_trade(req)
+            self.spot_ob_api.subscribe_orderbook(req)
+        else:
+            self.futures_ws_api.subscribe_market_trade(req)
+            self.futures_ob_api.subscribe_orderbook(req)
 
     def send_order(self, req: OrderRequest) -> str:
         """Send new order"""
@@ -213,8 +235,13 @@ class BtseGateway(BaseGateway):
         self.spot_ob_api.stop()
         self.spot_ws_api.stop()
 
+    def on_contract(self, contract: ContractData) -> None:
+        """Save a copy of contract"""
+        self.contracts[contract.symbol] = contract
+        super().on_contract(contract)
+
     def on_order(self, order: OrderData) -> None:
-        """Save a copy of order and then pus"""
+        """Save a copy of order and then push"""
         self.orders[order.orderid] = order
         super().on_order(order)
 
@@ -284,18 +311,16 @@ class SpotRestApi(RestClient):
         self.key = key
         self.secret = secret
 
-        self.connect_time = int(datetime.now().strftime("%y%m%d%H%M%S"))
-
         server_hosts: dict[str, str] = {
-            "REAL": REAL_REST_HOST,
-            "TESTNET": TESTNET_REST_HOST,
+            "REAL": REAL_SPOT_REST_HOST,
+            "TESTNET": TESTNET_SPOT_REST_HOST,
         }
 
         host: str = server_hosts[server]
         self.init(host, proxy_host, proxy_port)
 
         self.start()
-        self.gateway.write_log("REST API started")
+        self.gateway.write_log("Spot REST API started")
 
         self.query_time()
         self.query_order()
@@ -374,7 +399,7 @@ class SpotRestApi(RestClient):
 
             self.gateway.on_order(order)
 
-        self.gateway.write_log("Open orders data is received")
+        self.gateway.write_log("Spot open orders data is received")
 
     def on_query_account(self, packet: dict, request: Request) -> None:
         """Callback of account balance query"""
@@ -410,7 +435,7 @@ class SpotRestApi(RestClient):
 
             self.gateway.on_contract(contract)
 
-        self.gateway.write_log("Available contracts data is received")
+        self.gateway.write_log("Spot available contracts data is received")
 
     def on_error(
         self,
@@ -422,7 +447,7 @@ class SpotRestApi(RestClient):
         """General error callback"""
         detail: str = self.exception_detail(exception_type, exception_value, tb, request)
 
-        msg: str = f"Exception catched by REST API: {detail}"
+        msg: str = f"Exception catched by spot REST API: {detail}"
         self.gateway.write_log(msg)
 
         print(detail)
@@ -519,8 +544,8 @@ class SpotOrderbookApi(WebsocketClient):
     ) -> None:
         """Start server connection"""
         server_hosts: dict[str, str] = {
-            "REAL": REAL_ORDERBOOK_HOST,
-            "TESTNET": TESTNET_ORDERBOOK_HOST,
+            "REAL": REAL_SPOT_ORDERBOOK_HOST,
+            "TESTNET": TESTNET_SPOT_ORDERBOOK_HOST,
         }
 
         host: str = server_hosts[server]
@@ -541,11 +566,11 @@ class SpotOrderbookApi(WebsocketClient):
 
     def on_connected(self) -> None:
         """Callback when server is connected"""
-        self.gateway.write_log("Orderbook API is connected")
+        self.gateway.write_log("Spot orderbook API is connected")
 
     def on_disconnected(self) -> None:
         """Callback when server is disconnected"""
-        self.gateway.write_log("Orderbook websocket API is disconnected")
+        self.gateway.write_log("Spot orderbook websocket API is disconnected")
 
     def on_packet(self, packet: dict) -> None:
         """Callback of data update"""
@@ -555,7 +580,7 @@ class SpotOrderbookApi(WebsocketClient):
                 error_code: int = error["code"]
                 error_message: str = error["message"]
 
-                msg: str = f"Request caused error by orderbook API, code: {error_code}, message: {error_message}"
+                msg: str = f"Request caused error by spot orderbook API, code: {error_code}, message: {error_message}"
                 self.gateway.write_log(msg)
 
             return
@@ -576,7 +601,7 @@ class SpotOrderbookApi(WebsocketClient):
         """General error callback"""
         detail: str = self.exception_detail(exception_type, exception_value, tb)
 
-        msg: str = f"Exception catched by orderbook API: {detail}"
+        msg: str = f"Exception catched by spot orderbook API: {detail}"
         self.gateway.write_log(msg)
 
         print(detail)
@@ -637,11 +662,9 @@ class SpotWebsocketApi(WebsocketClient):
         self.key = key
         self.secret = secret
 
-        self.connect_time = int(datetime.now().strftime("%y%m%d%H%M%S"))
-
         server_hosts: dict[str, str] = {
-            "REAL": REAL_WEBSOCKET_HOST,
-            "TESTNET": TESTNET_WEBSOCKET_HOST,
+            "REAL": REAL_SPOT_WEBSOCKET_HOST,
+            "TESTNET": TESTNET_SPOT_WEBSOCKET_HOST,
         }
 
         host: str = server_hosts[server]
@@ -651,12 +674,12 @@ class SpotWebsocketApi(WebsocketClient):
 
     def on_connected(self) -> None:
         """Callback when server is connected"""
-        self.gateway.write_log("Private websocket API is connected")
+        self.gateway.write_log("Spot websocket API is connected")
         self.login()
 
     def on_disconnected(self) -> None:
         """Callback when server is disconnected"""
-        self.gateway.write_log("Private websocket API is disconnected")
+        self.gateway.write_log("Spot websocket API is disconnected")
 
     def on_packet(self, packet: dict) -> None:
         """Callback of data update"""
@@ -667,7 +690,7 @@ class SpotWebsocketApi(WebsocketClient):
                 error_code: int = error["code"]
                 error_message: str = error["message"]
 
-                msg: str = f"Request caused error by websocket API, code: {error_code}, message: {error_message}"
+                msg: str = f"Request caused error by spot websocket API, code: {error_code}, message: {error_message}"
                 self.gateway.write_log(msg)
 
             return
@@ -688,14 +711,14 @@ class SpotWebsocketApi(WebsocketClient):
         """General error callback"""
         detail: str = self.exception_detail(exception_type, exception_value, tb)
 
-        msg: str = f"Exception catched by websocket API: {detail}"
+        msg: str = f"Exception catched by spot websocket API: {detail}"
         self.gateway.write_log(msg)
 
         print(detail)
 
     def on_login(self, packet: dict) -> None:
         """Callback of user login"""
-        self.gateway.write_log("Websocket API login successful")
+        self.gateway.write_log("Spot websocket API login successful")
 
         self.subscribe_topic()
 
@@ -838,8 +861,6 @@ class FuturesRestApi(RestClient):
         self.key = key
         self.secret = secret
 
-        self.connect_time = int(datetime.now().strftime("%y%m%d%H%M%S"))
-
         server_hosts: dict[str, str] = {
             "REAL": REAL_FUTURES_REST_HOST,
             "TESTNET": TESTNET_FUTURES_REST_HOST,
@@ -849,7 +870,7 @@ class FuturesRestApi(RestClient):
         self.init(host, proxy_host, proxy_port)
 
         self.start()
-        self.gateway.write_log("REST API started")
+        self.gateway.write_log("Futures REST API started")
 
         self.query_order()
         self.query_position()
@@ -910,7 +931,7 @@ class FuturesRestApi(RestClient):
 
             self.gateway.on_order(order)
 
-        self.gateway.write_log("Open orders data is received")
+        self.gateway.write_log("Futures open orders data is received")
 
     def on_query_position(self, packet: dict, request: Request) -> None:
         """Callback of holding positions query"""
@@ -951,7 +972,7 @@ class FuturesRestApi(RestClient):
 
             self.gateway.on_contract(contract)
 
-        self.gateway.write_log("Available futures contracts data is received")
+        self.gateway.write_log("Futures available contracts data is received")
 
     def on_error(
         self,
@@ -1060,8 +1081,8 @@ class FuturesOrderbookApi(WebsocketClient):
     ) -> None:
         """Start server connection"""
         server_hosts: dict[str, str] = {
-            "REAL": REAL_ORDERBOOK_HOST,
-            "TESTNET": TESTNET_ORDERBOOK_HOST,
+            "REAL": REAL_FUTURES_ORDERBOOK_HOST,
+            "TESTNET": TESTNET_FUTURES_ORDERBOOK_HOST,
         }
 
         host: str = server_hosts[server]
@@ -1082,11 +1103,11 @@ class FuturesOrderbookApi(WebsocketClient):
 
     def on_connected(self) -> None:
         """Callback when server is connected"""
-        self.gateway.write_log("Orderbook API is connected")
+        self.gateway.write_log("Futures orderbook API is connected")
 
     def on_disconnected(self) -> None:
         """Callback when server is disconnected"""
-        self.gateway.write_log("Orderbook websocket API is disconnected")
+        self.gateway.write_log("Futures orderbook API is disconnected")
 
     def on_packet(self, packet: dict) -> None:
         """Callback of data update"""
@@ -1096,7 +1117,7 @@ class FuturesOrderbookApi(WebsocketClient):
                 error_code: int = error["code"]
                 error_message: str = error["message"]
 
-                msg: str = f"Request caused error by orderbook API, code: {error_code}, message: {error_message}"
+                msg: str = f"Request caused error by futures orderbook API, code: {error_code}, message: {error_message}"
                 self.gateway.write_log(msg)
 
             return
@@ -1117,7 +1138,7 @@ class FuturesOrderbookApi(WebsocketClient):
         """General error callback"""
         detail: str = self.exception_detail(exception_type, exception_value, tb)
 
-        msg: str = f"Exception catched by orderbook API: {detail}"
+        msg: str = f"Exception catched by futures orderbook API: {detail}"
         self.gateway.write_log(msg)
 
         print(detail)
@@ -1178,11 +1199,9 @@ class FuturesWebsocketApi(WebsocketClient):
         self.key = key
         self.secret = secret
 
-        self.connect_time = int(datetime.now().strftime("%y%m%d%H%M%S"))
-
         server_hosts: dict[str, str] = {
-            "REAL": REAL_WEBSOCKET_HOST,
-            "TESTNET": TESTNET_WEBSOCKET_HOST,
+            "REAL": REAL_FUTURES_WEBSOCKET_HOST,
+            "TESTNET": TESTNET_FUTURES_WEBSOCKET_HOST,
         }
 
         host: str = server_hosts[server]
@@ -1192,12 +1211,12 @@ class FuturesWebsocketApi(WebsocketClient):
 
     def on_connected(self) -> None:
         """Callback when server is connected"""
-        self.gateway.write_log("Private websocket API is connected")
+        self.gateway.write_log("Futures websocket API is connected")
         self.login()
 
     def on_disconnected(self) -> None:
         """Callback when server is disconnected"""
-        self.gateway.write_log("Private websocket API is disconnected")
+        self.gateway.write_log("Futures websocket API is disconnected")
 
     def on_packet(self, packet: dict) -> None:
         """Callback of data update"""
@@ -1208,7 +1227,7 @@ class FuturesWebsocketApi(WebsocketClient):
                 error_code: int = error["code"]
                 error_message: str = error["message"]
 
-                msg: str = f"Request caused error by websocket API, code: {error_code}, message: {error_message}"
+                msg: str = f"Request caused error by futures websocket API, code: {error_code}, message: {error_message}"
                 self.gateway.write_log(msg)
 
             return
@@ -1229,14 +1248,14 @@ class FuturesWebsocketApi(WebsocketClient):
         """General error callback"""
         detail: str = self.exception_detail(exception_type, exception_value, tb)
 
-        msg: str = f"Exception catched by websocket API: {detail}"
+        msg: str = f"Exception catched by futures websocket API: {detail}"
         self.gateway.write_log(msg)
 
         print(detail)
 
     def on_login(self, packet: dict) -> None:
         """Callback of user login"""
-        self.gateway.write_log("Websocket API login successful")
+        self.gateway.write_log("Futures websocket API login successful")
 
         self.subscribe_topic()
 
@@ -1298,7 +1317,7 @@ class FuturesWebsocketApi(WebsocketClient):
     def login(self) -> None:
         """User login"""
         timestamp: str = str(int(time.time() * 1000))
-        msg: str = f"/ws/spot{timestamp}"
+        msg: str = f"/ws/futures{timestamp}"
         signature: str = generate_signature(msg, self.secret)
 
         btse_req: dict = {
