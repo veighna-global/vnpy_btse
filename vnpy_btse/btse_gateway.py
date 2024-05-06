@@ -7,7 +7,7 @@ from types import TracebackType
 
 from requests import Response
 
-from vnpy_evo.event import EventEngine
+from vnpy_evo.event import EventEngine, Event
 from vnpy_evo.trader.constant import (
     Direction,
     Exchange,
@@ -32,6 +32,7 @@ from vnpy_evo.trader.object import (
     TickData,
     TradeData
 )
+from vnpy_evo.trader.event import EVENT_TIMER
 from vnpy_rest import Request, RestClient
 from vnpy_websocket import WebsocketClient
 
@@ -238,7 +239,8 @@ class BtseGateway(BaseGateway):
 
     def query_account(self) -> None:
         """Not required since BTSE provides websocket update"""
-        pass
+        self.spot_rest_api.query_account()
+        self.futures_rest_api.query_account()
 
     def query_position(self) -> None:
         """Not required since BTSE provides websocket update"""
@@ -276,6 +278,20 @@ class BtseGateway(BaseGateway):
     def get_tick(self, symbol: str) -> TickData:
         """Get previously saved tick"""
         return self.ticks.get(symbol, None)
+
+    def process_timer_event(self, event: Event) -> None:
+        """定时事件处理"""
+        self.count += 1
+        if self.count < 2:
+            return
+        self.count = 0
+
+        self.query_account()
+
+    def init_query(self) -> None:
+        """初始化查询任务"""
+        self.count: int = 0
+        self.event_engine.register(EVENT_TIMER, self.process_timer_event)
 
 
 class SpotRestApi(RestClient):
@@ -369,6 +385,9 @@ class SpotRestApi(RestClient):
 
     def query_account(self) -> None:
         """Query account balance"""
+        if not self.key:
+            return
+
         self.add_request(
             "GET",
             "/api/v3.2/user/wallet",
@@ -487,7 +506,7 @@ class SpotRestApi(RestClient):
                 continue
 
             account: AccountData = AccountData(
-                accountid=d["currency"],
+                accountid="SPOT_" + d["currency"],
                 balance=d["total"],
                 frozen=d["total"] - d["available"],
                 gateway_name=self.gateway_name,
@@ -994,6 +1013,7 @@ class FuturesRestApi(RestClient):
 
         self.query_order()
         self.query_position()
+        self.query_account()
         self.query_contract()
 
     def query_order(self) -> None:
@@ -1002,6 +1022,17 @@ class FuturesRestApi(RestClient):
             "GET",
             "/api/v2.1/user/open_orders",
             callback=self.on_query_order,
+        )
+
+    def query_account(self) -> None:
+        """Query account balance"""
+        if not self.key:
+            return
+
+        self.add_request(
+            "GET",
+            "/api/v2.1/user/wallet",
+            callback=self.on_query_account,
         )
 
     def query_position(self) -> None:
@@ -1121,6 +1152,20 @@ class FuturesRestApi(RestClient):
                 gateway_name=self.gateway_name,
             )
             self.gateway.on_position(position)
+
+    def on_query_account(self, packet: dict, request: Request) -> None:
+        """Callback of account balance query"""
+        for d in packet:
+            if not d["totalValue"]:
+                continue
+
+            account: AccountData = AccountData(
+                accountid="FUTURES_" + d["wallet"],
+                balance=d["marginBalance"],
+                frozen=d["marginBalance"] - d["availableBalance"],
+                gateway_name=self.gateway_name,
+            )
+            self.gateway.on_account(account)
 
     def on_query_contract(self, packet: dict, request: Request) -> None:
         """Callback of available contracts query"""
