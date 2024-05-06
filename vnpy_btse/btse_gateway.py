@@ -422,7 +422,7 @@ class SpotRestApi(RestClient):
 
     def cancel_order(self, req: CancelRequest) -> None:
         """Cancel existing order"""
-        data: dict = {
+        params: dict = {
             "symbol": req.symbol,
             "clOrderID": req.orderid
         }
@@ -433,7 +433,7 @@ class SpotRestApi(RestClient):
             method="DELETE",
             path="/api/v3.2/order",
             callback=self.on_cancel_order,
-            json=data,
+            params=params,
             on_failed=self.on_cancel_failed,
             extra=order
         )
@@ -559,11 +559,6 @@ class SpotRestApi(RestClient):
 
     def on_cancel_failed(self, status_code: str, request: Request) -> None:
         """Failed callback of cancel_order"""
-        if request.extra:
-            order = request.extra
-            order.status = Status.REJECTED
-            self.gateway.on_order(order)
-
         msg = f"Cancel spot order failed, status code: {status_code}, message: {request.response.text}, order: {request.extra} "
         self.gateway.write_log(msg)
 
@@ -849,17 +844,23 @@ class SpotWebsocketApi(WebsocketClient):
         order: OrderData = OrderData(
             symbol=data["symbol"],
             exchange=Exchange.BTSE,
-            type=ORDERTYPE_BTSE2VT[data["type"]],
             orderid=local_id,
-            direction=DIRECTION_BTSE2VT[data["side"]],
             offset=Offset.NONE,
-            traded=data["fillSize"],
-            price=data["price"],
-            volume=data["size"],
-            status=STATUS_BTSE2VT.get(data["status"], Status.SUBMITTING),
             datetime=parse_timestamp(data["timestamp"]),
             gateway_name=self.gateway_name,
         )
+
+        status: Status = STATUS_BTSE2VT.get(data["status"], None)
+        if status:
+            order.type = ORDERTYPE_BTSE2VT[data["type"]]
+            order.direction = DIRECTION_BTSE2VT[data["side"]]
+            order.traded = data["fillSize"]
+            order.price = data["price"]
+            order.volume = data["size"]
+            order.status = status
+        else:
+            order.status = Status.REJECTED
+
         self.gateway.on_order(order)
 
     def on_trade(self, packet: dict) -> None:
@@ -940,6 +941,9 @@ class FuturesRestApi(RestClient):
         self.key: str = ""
         self.secret: str = ""
 
+        self.order_count: int = 1_000_000
+        self.order_prefix: str = ""
+
     def sign(self, request: Request) -> Request:
         """Standard callback for signing a request"""
         # Generate signature
@@ -974,6 +978,8 @@ class FuturesRestApi(RestClient):
         """Start server connection"""
         self.key = key
         self.secret = secret
+
+        self.order_prefix = datetime.now().strftime("%y%m%d%H%M%S")
 
         server_hosts: dict[str, str] = {
             "REAL": REAL_FUTURES_REST_HOST,
@@ -1012,6 +1018,61 @@ class FuturesRestApi(RestClient):
             "GET",
             "/api/v2.1/market_summary",
             callback=self.on_query_contract
+        )
+
+    def send_order(self, req: OrderRequest) -> str:
+        """Send new order"""
+        # Generate new order id
+        self.order_count += 1
+        orderid: str = self.order_prefix + str(self.order_count)
+
+        # Push a submitting order event
+        order: OrderData = req.create_order_data(
+            orderid,
+            self.gateway_name
+        )
+        self.gateway.on_order(order)
+
+        data: dict = {
+            "symbol": req.symbol,
+            "size": req.volume,
+            "side": DIRECTION_VT2BTSE[req.direction],
+            "type": ORDERTYPE_VT2BTSE[req.type],
+            "clOrderID": orderid,
+        }
+
+        if req.type == OrderType.LIMIT:
+            data["time_in_force"] = "GTC"
+            data["price"] = req.price
+
+        self.add_request(
+            method="POST",
+            path="/api/v2.1/order",
+            callback=self.on_send_order,
+            json=data,
+            extra=order,
+            on_error=self.on_send_order_error,
+            on_failed=self.on_send_order_failed
+        )
+
+        return order.vt_orderid
+
+    def cancel_order(self, req: CancelRequest) -> None:
+        """Cancel existing order"""
+        params: dict = {
+            "symbol": req.symbol,
+            "clOrderID": req.orderid
+        }
+
+        order: OrderData = self.gateway.get_order(req.orderid)
+
+        self.add_request(
+            method="DELETE",
+            path="/api/v2.1/order",
+            callback=self.on_cancel_order,
+            params=params,
+            on_failed=self.on_cancel_failed,
+            extra=order
         )
 
     def on_query_order(self, packet: dict, request: Request) -> None:
@@ -1102,6 +1163,37 @@ class FuturesRestApi(RestClient):
         self.gateway.write_log(msg)
 
         print(detail)
+
+    def on_send_order(self, data: dict, request: Request) -> None:
+        """Successful callback of send_order"""
+        pass
+
+    def on_send_order_failed(self, status_code: str, request: Request) -> None:
+        """Failed callback of send_order"""
+        order: OrderData = request.extra
+        order.status = Status.REJECTED
+        self.gateway.on_order(order)
+
+        msg: str = f"Send futures order failed, status code: {status_code}, message: {request.response.text}"
+        self.gateway.write_log(msg)
+
+    def on_send_order_error(self, exception_type: type, exception_value: Exception, tb, request: Request) -> None:
+        """Error callback of send_order"""
+        order: OrderData = request.extra
+        order.status = Status.REJECTED
+        self.gateway.on_order(order)
+
+        if not issubclass(exception_type, ConnectionError):
+            self.on_error(exception_type, exception_value, tb, request)
+
+    def on_cancel_order(self, data: dict, request: Request) -> None:
+        """Successful callback of cancel_order"""
+        pass
+
+    def on_cancel_failed(self, status_code: str, request: Request) -> None:
+        """Failed callback of cancel_order"""
+        msg = f"Cancel futures order failed, status code: {status_code}, message: {request.response.text}, order: {request.extra} "
+        self.gateway.write_log(msg)
 
     def query_history(self, req: HistoryRequest) -> list[BarData]:
         """Query kline history data"""
@@ -1374,29 +1466,34 @@ class FuturesWebsocketApi(WebsocketClient):
 
     def on_order(self, packet: dict) -> None:
         """Callback of order update"""
-        data: dict = packet["data"]
+        for data in packet["data"]:
+            local_id: str = data["clOrderID"]
+            sys_id: str = data["orderID"]
 
-        local_id: str = data["clOrderID"]
-        sys_id: str = data["orderID"]
+            local_sys_map[local_id] = sys_id
+            sys_local_map[sys_id] = local_id
 
-        local_sys_map[local_id] = sys_id
-        sys_local_map[sys_id] = local_id
+            order: OrderData = OrderData(
+                symbol=data["symbol"],
+                exchange=Exchange.BTSE,
+                orderid=local_id,
+                offset=Offset.NONE,
+                datetime=parse_timestamp(data["timestamp"]),
+                gateway_name=self.gateway_name,
+            )
 
-        order: OrderData = OrderData(
-            symbol=data["symbol"],
-            exchange=Exchange.BTSE,
-            type=ORDERTYPE_BTSE2VT[data["type"]],
-            orderid=local_id,
-            direction=DIRECTION_BTSE2VT[data["side"]],
-            offset=Offset.NONE,
-            traded=data["fillSize"],
-            price=data["price"],
-            volume=data["size"],
-            status=STATUS_BTSE2VT.get(data["status"], Status.SUBMITTING),
-            datetime=parse_timestamp(data["timestamp"]),
-            gateway_name=self.gateway_name,
-        )
-        self.gateway.on_order(order)
+            status: Status = STATUS_BTSE2VT.get(data["status"], None)
+            if status:
+                order.type = ORDERTYPE_BTSE2VT[data["type"]]
+                order.direction = DIRECTION_BTSE2VT[data["side"]]
+                order.traded = data["fillSize"]
+                order.price = data["price"]
+                order.volume = data["size"]
+                order.status = status
+            else:
+                order.status = Status.REJECTED
+
+            self.gateway.on_order(order)
 
     def on_trade(self, packet: dict) -> None:
         """Callback of trade update"""
