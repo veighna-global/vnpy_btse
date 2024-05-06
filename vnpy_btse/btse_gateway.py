@@ -199,6 +199,7 @@ class BtseGateway(BaseGateway):
         tick: TickData = TickData(
             symbol=req.symbol,
             exchange=req.exchange,
+            name=req.symbol,
             datetime=datetime.now(),
             gateway_name=self.gateway_name
         )
@@ -1619,7 +1620,9 @@ class FuturesWebsocketApi(WebsocketClient):
     def subscribe_market_trade(self, req: SubscribeRequest) -> None:
         """Subscribe market trade fill"""
         topic: str = f"tradeHistoryApi:{req.symbol}"
+
         self.callbacks[topic] = self.on_market_trade
+        self.callbacks["tradeHistoryApi"] = self.on_market_trade
 
         btse_req: dict = {
             "op": "subscribe",
