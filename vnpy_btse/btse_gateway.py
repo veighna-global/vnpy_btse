@@ -249,13 +249,24 @@ class BtseGateway(BaseGateway):
 
     def query_history(self, req: HistoryRequest) -> list[BarData]:
         """Query kline history data"""
-        return self.spot_rest_api.query_history(req)
+        contract: ContractData = self.contracts.get(req.symbol, None)
+        if not contract:
+            return
+
+        if contract.product == Product.SPOT:
+            return self.spot_rest_api.query_history(req)
+        else:
+            return self.futures_rest_api.query_history(req)
 
     def close(self) -> None:
         """Close server connections"""
         self.spot_rest_api.stop()
         self.spot_ob_api.stop()
         self.spot_ws_api.stop()
+
+        self.futures_rest_api.stop()
+        self.futures_ob_api.stop()
+        self.futures_ws_api.stop()
 
     def on_contract(self, contract: ContractData) -> None:
         """Save a copy of contract"""
@@ -585,42 +596,39 @@ class SpotRestApi(RestClient):
     def query_history(self, req: HistoryRequest) -> list[BarData]:
         """Query kline history data"""
         buf: dict[datetime, BarData] = {}
-        end_time: str = ""
-        path: str = "/api/v5/market/candles"
 
-        for i in range(15):
-            # Create query params
+        start_time: int = int(datetime.timestamp(req.start)) * 1000
+
+        while True:
+            # Create query parameters
             params: dict = {
-                "instId": req.symbol,
-                "bar": INTERVAL_VT2BTSE[req.interval]
+                "symbol": req.symbol,
+                "resolution": INTERVAL_VT2BTSE[req.interval],
+                "start": start_time,
             }
 
-            if end_time:
-                params["after"] = end_time
-
-            # Get response from server
             resp: Response = self.request(
                 "GET",
-                path,
+                path="/api/v3.2/ohlcv",
                 params=params
             )
 
-            # Break loop if request is failed
+            # Break the loop if request failed
             if resp.status_code // 100 != 2:
-                msg = f"Query kline history failed, status code: {resp.status_code}, message: {resp.text}"
+                msg: str = f"Query kline history failed, status code: {resp.status_code}, message: {resp.text}"
                 self.gateway.write_log(msg)
                 break
             else:
                 data: dict = resp.json()
-
-                if not data["data"]:
-                    m = data["msg"]
-                    msg = f"No kline history data is received, {m}"
+                if not data:
+                    msg: str = f"No kline history data is received, start time: {start_time}"
+                    self.gateway.write_log(msg)
                     break
 
-                for bar_list in data["data"]:
-                    ts, o, h, l, c, vol, _ = bar_list
-                    dt = parse_timestamp(ts)
+                for bar_list in data:
+                    ts, o, h, l, c, vol = bar_list
+                    dt: datetime = parse_timestamp(ts, False)
+
                     bar: BarData = BarData(
                         symbol=req.symbol,
                         exchange=req.exchange,
@@ -635,14 +643,20 @@ class SpotRestApi(RestClient):
                     )
                     buf[bar.datetime] = bar
 
-                begin: str = data["data"][-1][0]
-                end: str = data["data"][0][0]
-                msg: str = f"Query kline history finished, {req.symbol} - {req.interval.value}, {parse_timestamp(begin)} - {parse_timestamp(end)}"
+                start_time: int = data[-1][0]
+                end_time: int = data[0][0]
+
+                msg: str = f"Query kline history finished, {req.symbol} - {req.interval.value}, {parse_timestamp(start_time, False)} - {parse_timestamp(end_time, False)}"
                 self.gateway.write_log(msg)
 
-                # Update end time
-                end_time = begin
+                # Break the loop if the latest data received
+                if len(data) < 300:
+                    break
 
+                # Update query start time
+                start_time = end_time
+
+        # Sort by datetime and return bar list
         index: list[datetime] = list(buf.keys())
         index.sort()
 
@@ -1243,42 +1257,39 @@ class FuturesRestApi(RestClient):
     def query_history(self, req: HistoryRequest) -> list[BarData]:
         """Query kline history data"""
         buf: dict[datetime, BarData] = {}
-        end_time: str = ""
-        path: str = "/api/v5/market/candles"
 
-        for i in range(15):
-            # Create query params
+        start_time: int = int(datetime.timestamp(req.start)) * 1000
+
+        while True:
+            # Create query parameters
             params: dict = {
-                "instId": req.symbol,
-                "bar": INTERVAL_VT2BTSE[req.interval]
+                "symbol": req.symbol,
+                "resolution": INTERVAL_VT2BTSE[req.interval],
+                "start": start_time,
             }
 
-            if end_time:
-                params["after"] = end_time
-
-            # Get response from server
             resp: Response = self.request(
                 "GET",
-                path,
+                path="/api/v2.1/ohlcv",
                 params=params
             )
 
-            # Break loop if request is failed
+            # Break the loop if request failed
             if resp.status_code // 100 != 2:
-                msg = f"Query kline history failed, status code: {resp.status_code}, message: {resp.text}"
+                msg: str = f"Query kline history failed, status code: {resp.status_code}, message: {resp.text}"
                 self.gateway.write_log(msg)
                 break
             else:
                 data: dict = resp.json()
-
-                if not data["data"]:
-                    m = data["msg"]
-                    msg = f"No kline history data is received, {m}"
+                if not data:
+                    msg: str = f"No kline history data is received, start time: {start_time}"
+                    self.gateway.write_log(msg)
                     break
 
-                for bar_list in data["data"]:
-                    ts, o, h, l, c, vol, _ = bar_list
-                    dt = parse_timestamp(ts)
+                for bar_list in data:
+                    ts, o, h, l, c, vol = bar_list
+                    dt: datetime = parse_timestamp(ts, False)
+
                     bar: BarData = BarData(
                         symbol=req.symbol,
                         exchange=req.exchange,
@@ -1293,14 +1304,20 @@ class FuturesRestApi(RestClient):
                     )
                     buf[bar.datetime] = bar
 
-                begin: str = data["data"][-1][0]
-                end: str = data["data"][0][0]
-                msg: str = f"Query kline history finished, {req.symbol} - {req.interval.value}, {parse_timestamp(begin)} - {parse_timestamp(end)}"
+                start_time: int = data[-1][0]
+                end_time: int = data[0][0]
+
+                msg: str = f"Query kline history finished, {req.symbol} - {req.interval.value}, {parse_timestamp(start_time, False)} - {parse_timestamp(end_time, False)}"
                 self.gateway.write_log(msg)
 
-                # Update end time
-                end_time = begin
+                # Break the loop if the latest data received
+                if len(data) < 300:
+                    break
 
+                # Update query start time
+                start_time = end_time
+
+        # Sort by datetime and return bar list
         index: list[datetime] = list(buf.keys())
         index.sort()
 
@@ -1649,9 +1666,12 @@ def generate_timestamp() -> str:
     return timestamp + "Z"
 
 
-def parse_timestamp(timestamp: int) -> datetime:
+def parse_timestamp(timestamp: int, is_millisecond: bool = True) -> datetime:
     """Parse timestamp to datetime"""
-    dt: datetime = datetime.fromtimestamp(timestamp / 1000)
+    if is_millisecond:
+        timestamp = timestamp / 1000
+
+    dt: datetime = datetime.fromtimestamp(timestamp)
     return dt.replace(tzinfo=UTC_TZ)
 
 
