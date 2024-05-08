@@ -214,7 +214,7 @@ class BtseGateway(BaseGateway):
             self.spot_ob_api.subscribe_orderbook(req)
         else:
             self.futures_ws_api.subscribe_market_trade(req)
-            self.futures_ob_api.subscribe_orderbook(req)
+            self.futures_ob_api.subscribe_snapshot(req)
 
     def send_order(self, req: OrderRequest) -> str:
         """Send new order"""
@@ -472,7 +472,7 @@ class SpotRestApi(RestClient):
     def on_query_time(self, packet: dict, request: Request) -> None:
         """Callback of server time query"""
         timestamp: int = packet["epoch"]
-        server_time: datetime = datetime.fromtimestamp(timestamp / 1000)
+        server_time: datetime = datetime.fromtimestamp(timestamp)
         local_time: datetime = datetime.now()
 
         msg: str = f"Server time: {server_time}, local time: {local_time}"
@@ -697,10 +697,10 @@ class SpotOrderbookApi(WebsocketClient):
 
         self.start()
 
-    def subscribe_orderbook(self, req: SubscribeRequest) -> None:
+    def subscribe_snapshot(self, req: SubscribeRequest) -> None:
         """Subscribe market data"""
         topic: str = f"snapshotL1:{req.symbol}_0"
-        self.callbacks[topic] = self.on_orderbook
+        self.callbacks[topic] = self.on_snapshot
 
         btse_req: dict = {
             "op": "subscribe",
@@ -750,7 +750,7 @@ class SpotOrderbookApi(WebsocketClient):
 
         print(detail)
 
-    def on_orderbook(self, packet: dict) -> None:
+    def on_snapshot(self, packet: dict) -> None:
         """Callback of market trade update"""
         data: dict = packet["data"]
 
@@ -1358,10 +1358,10 @@ class FuturesOrderbookApi(WebsocketClient):
 
         self.start()
 
-    def subscribe_orderbook(self, req: SubscribeRequest) -> None:
+    def subscribe_snapshot(self, req: SubscribeRequest) -> None:
         """Subscribe market data"""
         topic: str = f"snapshotL1:{req.symbol}_0"
-        self.callbacks[topic] = self.on_orderbook
+        self.callbacks[topic] = self.on_snapshot
 
         btse_req: dict = {
             "op": "subscribe",
@@ -1411,7 +1411,7 @@ class FuturesOrderbookApi(WebsocketClient):
 
         print(detail)
 
-    def on_orderbook(self, packet: dict) -> None:
+    def on_snapshot(self, packet: dict) -> None:
         """Callback of market trade update"""
         data: dict = packet["data"]
 
